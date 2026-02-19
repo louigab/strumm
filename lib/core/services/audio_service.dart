@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_audio_capture/flutter_audio_capture.dart';
@@ -8,55 +7,34 @@ import 'package:pitch_detector_dart/pitch_detector.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 /// Service that handles microphone audio capture and pitch detection.
-/// Mode for listening behavior: automatic detects which note is being played,
-/// manual listens only for a single forced target note set by the UI.
-enum ListenMode { automatic, manual }
-
-/// Simple container representing a detected note and tuning offset.
-class DetectedNote {
-  final String name;
-  final double frequency;
-  final double cents; // positive = sharp, negative = flat
-
-  DetectedNote({required this.name, required this.frequency, required this.cents});
-}
-
 class AudioService {
   FlutterAudioCapture? _audioCapture;
   PitchDetector? _pitchDetector;
 
   final StreamController<double> _pitchController =
       StreamController<double>.broadcast();
-  final StreamController<DetectedNote> _noteController =
-      StreamController<DetectedNote>.broadcast();
 
   bool _isListening = false;
   bool _isProcessing = false;
+  // Smoothed recent confidence to ignore one-off transients
+  double _confidenceAvg = 0.0;
+  // Higher smoothing -> requires sustained confidence before accepting
+  static const double _confidenceSmoothing = 0.85;
+  // Raised gate to be stricter about emitting pitches
+  static const double _confidenceThreshold = 0.75;
   int _frameCount = 0;
   static const int _sampleRate = 44100;
   static const int _bufferSize = 2048;
-  static const int _frameSkip = 2; // Process every 2nd frame to reduce load
-
-  // Listening mode (automatic by default)
-  ListenMode _mode = ListenMode.automatic;
-
-  // Manual target MIDI note (0-127). If null, manual mode won't emit.
-  int? _manualTargetMidi;
-
-  // Threshold in cents for manual accepting a detection (default 50 cents)
-  double _manualThresholdCents = 50.0;
+  static const int _frameSkip = 1; // Every frame — max detection rate for best sensitivity
 
   /// Stream of detected pitch frequencies.
   Stream<double> get pitchStream => _pitchController.stream;
-  /// Stream of detected notes (name + cents offset).
-  Stream<DetectedNote> get noteStream => _noteController.stream;
 
   /// Whether the service is currently capturing audio.
   bool get isListening => _isListening;
 
   /// Request microphone permission. Returns true if granted.
   Future<bool> requestPermission() async {
-    if (kIsWeb) return true; // Web handles permissions through browser API
     final status = await Permission.microphone.request();
     return status.isGranted;
   }
@@ -119,56 +97,77 @@ class AudioService {
     );
   }
 
-  /// Clean audio data with noise gate and low-pass filter.
+  /// Clean audio data with noise gate and O(n) IIR low-pass filter.
   /// Returns empty list if signal is below threshold (to prevent ghost tuning).
   List<double> cleanAudioData(List<double> buffer) {
     if (buffer.isEmpty) return [];
 
-    // 1. Calculate RMS (Root Mean Square) for noise gate
+    // 1. Calculate RMS for noise gate (single pass)
     double sumSquares = 0;
     for (final sample in buffer) {
       sumSquares += sample * sample;
     }
     final rms = sqrt(sumSquares / buffer.length);
 
-    // Noise gate: return empty if signal is too weak (0.05 threshold)
-    if (rms < 0.05) {
+    // Noise gate: return empty if signal is too weak
+    // Raised slightly to ignore faint background noise while keeping
+    // genuine string sustain audible.
+    if (rms < 0.015) {
       return [];
     }
 
-    // 2. Apply simple Low-Pass Filter (cut frequencies above 1200Hz)
-    // Using a basic moving average filter as a low-pass approximation
-    // Cutoff calculation: for 44100Hz sample rate, 1200Hz cutoff
-    final cutoffFreq = 1200.0;
-    final windowSize = (_sampleRate / cutoffFreq / 2).round().clamp(2, 10);
-    
-    final filtered = <double>[];
-    for (int i = 0; i < buffer.length; i++) {
-      double sum = 0;
-      int count = 0;
-      
-      // Moving average window
-      for (int j = max(0, i - windowSize); j <= min(buffer.length - 1, i + windowSize); j++) {
-        sum += buffer[j];
-        count++;
-      }
-      
-      filtered.add(sum / count);
+    // 2. Gentle low-pass to remove ultrasonic noise but preserve harmonics
+    const double alpha = 0.7;
+    final filtered = List<double>.filled(buffer.length, 0.0);
+    filtered[0] = buffer[0];
+    for (int i = 1; i < buffer.length; i++) {
+      filtered[i] = alpha * buffer[i] + (1.0 - alpha) * filtered[i - 1];
     }
 
-    // 3. Verify cleaned signal still has sufficient energy
+    // 3. Apply a lightweight band-pass (HP then LP) to focus on guitar range
+    // Tightened to typical guitar range to reject rumble and high hiss.
+    final bp = _applyBandpass(filtered, _sampleRate.toDouble(), 82.0, 880.0);
+
+    // 4. Quick energy check on bandpassed signal
     double filteredSumSquares = 0;
-    for (final sample in filtered) {
+    for (final sample in bp) {
       filteredSumSquares += sample * sample;
     }
-    final filteredRms = sqrt(filteredSumSquares / filtered.length);
-
-    // Return empty if filtered signal is too weak (prevents ghost tuning)
-    if (filteredRms < 0.03) {
+    if (sqrt(filteredSumSquares / bp.length) < 0.012) {
       return [];
     }
 
-    return filtered;
+    return bp;
+  }
+
+  // Simple first-order HP and LP cascade (not perfect, but cheap).
+  List<double> _applyBandpass(List<double> input, double sampleRate, double hpCut, double lpCut) {
+    final outHp = List<double>.filled(input.length, 0.0);
+    // High-pass one-pole
+    final rcHp = 1.0 / (2 * pi * hpCut);
+    final dt = 1.0 / sampleRate;
+    final alphaHp = rcHp / (rcHp + dt);
+    double prevOut = 0.0;
+    double prevIn = input[0];
+    for (int i = 0; i < input.length; i++) {
+      final x = input[i];
+      final y = alphaHp * (prevOut + x - prevIn);
+      outHp[i] = y;
+      prevOut = y;
+      prevIn = x;
+    }
+
+    final outLp = List<double>.filled(input.length, 0.0);
+    // Low-pass one-pole
+    final rcLp = 1.0 / (2 * pi * lpCut);
+    final alphaLp = dt / (rcLp + dt);
+    double s = outHp[0];
+    for (int i = 0; i < outHp.length; i++) {
+      s = s + alphaLp * (outHp[i] - s);
+      outLp[i] = s;
+    }
+
+    return outLp;
   }
 
   /// Detect pitch from audio buffer (fire-and-forget).
@@ -188,34 +187,30 @@ class AudioService {
         _isProcessing = false;
         return;
       }
-      
+      // Quick DSP confidence checks (autocorrelation, zero-crossing, sustain)
+      double conf = _computePitchConfidence(cleanedBuffer, _sampleRate.toDouble());
+
+      // Peakiness check: knocks are very peaky (high max/RMS). Penalize strongly.
+      double peak = 0.0;
+      for (final v in cleanedBuffer) {
+        peak = max(peak, v.abs());
+      }
+      final rms = sqrt(cleanedBuffer.map((e) => e * e).reduce((a, b) => a + b) / cleanedBuffer.length + 1e-12);
+      final peakiness = peak / (rms + 1e-12);
+      if (peakiness > 22.0) {
+        conf -= 0.5; // stronger penalty for impulse-like sounds
+      }
+
+      // Smooth confidence over recent buffers to avoid one-off detections
+      _confidenceAvg = _confidenceSmoothing * _confidenceAvg + (1 - _confidenceSmoothing) * conf;
+      if (_confidenceAvg < _confidenceThreshold) {
+        _isProcessing = false;
+        return;
+      }
+
       final result = await _pitchDetector!.getPitchFromFloatBuffer(cleanedBuffer);
       if (result.pitched && _isListening) {
-        final freq = result.pitch;
-
-        if (_mode == ListenMode.manual) {
-          // Only emit if a manual target is set and within threshold
-          if (_manualTargetMidi != null) {
-            final targetFreq = _midiToFreq(_manualTargetMidi!);
-            final cents = _freqToCentsRelative(freq, targetFreq);
-            if (cents.abs() <= _manualThresholdCents) {
-              _pitchController.add(freq);
-              _noteController.add(DetectedNote(
-                name: _midiToNoteName(_manualTargetMidi!),
-                frequency: freq,
-                cents: cents,
-              ));
-            }
-          }
-        } else {
-          // Automatic mode: always emit pitch and best-approx note
-          _pitchController.add(freq);
-          final midi = _freqToMidiNearest(freq);
-          final noteName = _midiToNoteName(midi);
-          final targetFreq = _midiToFreq(midi);
-          final cents = _freqToCentsRelative(freq, targetFreq);
-          _noteController.add(DetectedNote(name: noteName, frequency: freq, cents: cents));
-        }
+        _pitchController.add(result.pitch);
       }
     } catch (e) {
       debugPrint('Error detecting pitch: $e');
@@ -224,64 +219,64 @@ class AudioService {
     }
   }
 
-  /// Set listening mode.
-  void setMode(ListenMode mode) {
-    _mode = mode;
-  }
+  double _computePitchConfidence(List<double> buf, double sampleRate) {
+    // Autocorrelation peak relative to energy
+    final n = buf.length;
+    double sum = 0.0;
+    for (final v in buf) {
+      sum += v * v;
+    }
+    final energy = sum / n + 1e-12;
 
-  /// Set manual target by note name, e.g. "A4", "E2".
-  void setManualTargetByName(String noteName) {
-    final midi = _noteNameToMidi(noteName);
-    if (midi != null) _manualTargetMidi = midi;
-  }
+    // Zero-crossing rate
+    int zc = 0;
+    for (int i = 1; i < n; i++) {
+      if ((buf[i - 1] >= 0 && buf[i] < 0) || (buf[i - 1] < 0 && buf[i] >= 0)) {
+        zc++;
+      }
+    }
+    final zcr = zc / (n - 1);
 
-  /// Clear manual target.
-  void clearManualTarget() {
-    _manualTargetMidi = null;
-  }
+    // Autocorrelation in guitar pitch range
+    final minFreq = 80.0;
+    final maxFreq = 1100.0;
+    final maxLag = (sampleRate / minFreq).floor().clamp(1, n - 1);
+    final minLag = (sampleRate / maxFreq).floor().clamp(1, n - 1);
 
-  /// Set manual threshold in cents.
-  void setManualThresholdCents(double cents) {
-    _manualThresholdCents = cents;
-  }
+    double bestCorr = 0.0;
+    for (int lag = minLag; lag <= maxLag; lag++) {
+      double c = 0.0;
+      for (int i = 0; i < n - lag; i++) {
+        c += buf[i] * buf[i + lag];
+      }
+      final norm = c / (energy * (n - lag));
+      if (norm > bestCorr) {
+        bestCorr = norm;
+      }
+    }
 
-  double _midiToFreq(int midi) => 440.0 * pow(2, (midi - 69) / 12);
+    final autocorrScore = bestCorr.clamp(0.0, 1.0);
 
-  int _freqToMidiNearest(double freq) => (69 + 12 * (log(freq / 440.0) / ln2)).round();
+    // Simple sustain check: RMS tail vs head
+    final headLen = (n * 0.12).floor().clamp(1, n - 1);
+    final tailStart = (n * 0.5).floor();
+    double headSum = 0.0, tailSum = 0.0;
+    for (int i = 0; i < headLen; i++) {
+      headSum += buf[i] * buf[i];
+    }
+    for (int i = tailStart; i < n; i++) {
+      tailSum += buf[i] * buf[i];
+    }
+    final headRms = sqrt(headSum / headLen + 1e-12);
+    final tailRms = sqrt(tailSum / (n - tailStart) + 1e-12);
+    final sustainRatio = (tailRms / (headRms + 1e-12)).clamp(0.0, 1.0);
 
-  double _freqToCentsRelative(double freq, double targetFreq) =>
-      1200 * (log(freq / targetFreq) / ln2);
+    // If autocorrelation peak is very low, bail early (likely noise/impulse)
+    if (autocorrScore < 0.5) return 0.0;
 
-  String _midiToNoteName(int midi) {
-    const names = [
-      'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'
-    ];
-    final octave = (midi ~/ 12) - 1;
-    final name = names[midi % 12];
-    return '$name$octave';
-  }
-
-  int? _noteNameToMidi(String name) {
-    final regex = RegExp(r'^([A-Ga-g])(#?)(-?\d+)$');
-    final m = regex.firstMatch(name.replaceAll(' ', ''));
-    if (m == null) return null;
-    final letter = m.group(1)!.toUpperCase();
-    final sharp = m.group(2) == '#';
-    final octave = int.tryParse(m.group(3)!);
-    if (octave == null) return null;
-    final base = {
-      'C': 0,
-      'D': 2,
-      'E': 4,
-      'F': 5,
-      'G': 7,
-      'A': 9,
-      'B': 11,
-    }[letter]!;
-    var semitone = base + (sharp ? 1 : 0);
-    final midi = (octave + 1) * 12 + semitone;
-    if (midi < 0 || midi > 127) return null;
-    return midi;
+    // Confidence: give heavier weight to autocorrelation (harmonic periodicity)
+    final conf = 0.75 * autocorrScore + 0.15 * (1 - zcr) + 0.10 * sustainRatio;
+    return conf.clamp(0.0, 1.0);
   }
 
   /// Stop listening.
@@ -302,6 +297,5 @@ class AudioService {
   void dispose() {
     stopListening();
     _pitchController.close();
-    _noteController.close();
   }
 }

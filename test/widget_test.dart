@@ -11,7 +11,7 @@ import 'package:strumm/main.dart';
 
 void main() {
   testWidgets('App renders correctly', (WidgetTester tester) async {
-    await tester.pumpWidget(const StrummApp());
+    await tester.pumpWidget(const MyApp());
 
     // Verify app title is shown
     expect(find.text('strumm'), findsOneWidget);

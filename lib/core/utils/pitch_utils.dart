@@ -64,4 +64,66 @@ class PitchUtils {
 
     return closest;
   }
+
+  /// Sticky string detection with hysteresis.
+  ///
+  /// When [currentNote] is provided (the currently selected string), this
+  /// method checks whether the detected [frequency] is close enough to the
+  /// current note's fundamental or one of its harmonics. If it is, the
+  /// current note is kept — preventing the tuner from jumping to the wrong
+  /// string when a note is very flat/sharp or the pitch detector locks onto
+  /// a harmonic.
+  ///
+  /// A different string is only selected when the raw frequency is
+  /// significantly closer to that other string (by at least [hysteresisCents]
+  /// more than the current note).
+  static Note? findClosestStringSticky(
+    double frequency,
+    List<Note> tuningNotes, {
+    Note? currentNote,
+    double hysteresisCents = 200,
+  }) {
+    if (frequency <= 0 || tuningNotes.isEmpty) return null;
+
+    // If no current note, fall back to basic closest-match
+    if (currentNote == null) {
+      return findClosestString(frequency, tuningNotes);
+    }
+
+    // Check whether the frequency might be a harmonic of the current string.
+    // If the detected frequency is near 2×, 3×, or 4× the target fundamental,
+    // treat it as the same string (pitch detector picking up an overtone).
+    final fund = currentNote.frequency;
+    for (final multiplier in [1.0, 2.0, 3.0, 4.0]) {
+      final harmonicFreq = fund * multiplier;
+      final centsToHarmonic = centsDifference(frequency, harmonicFreq).abs();
+      if (centsToHarmonic < 150) {
+        // Close to a harmonic → stay on the current string
+        return currentNote;
+      }
+    }
+
+    // Find the absolute closest string
+    Note? closest;
+    double minCentsDiff = double.infinity;
+    for (final note in tuningNotes) {
+      final cents = centsDifference(frequency, note.frequency).abs();
+      if (cents < minCentsDiff) {
+        minCentsDiff = cents;
+        closest = note;
+      }
+    }
+
+    // How far is the frequency from the current note?
+    final currentCents = centsDifference(frequency, fund).abs();
+
+    // Only switch if the new string is closer by at least [hysteresisCents].
+    // This prevents the tuner from bouncing between adjacent strings when
+    // the player's note is very flat (e.g. low E at ~76 Hz near D).
+    if (closest != currentNote && (currentCents - minCentsDiff) < hysteresisCents) {
+      return currentNote; // stick to current
+    }
+
+    return closest;
+  }
 }
